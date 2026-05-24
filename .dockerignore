@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.huggingface/
+*.wav
+*.mp3
+*.m4a
+*.flac
+hf-cache/
+.vscode/
+.idea/
+*.swp

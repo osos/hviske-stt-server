@@ -1,0 +1,38 @@
+services:
+  hviske:
+    build: .
+    ports:
+      - "8082:${HVISKE_PORT:-8000}"
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HVISKE_MODEL_ID=${HVISKE_MODEL_ID:-syvai/hviske-v5.3}
+      - HVISKE_TARGET_SR=${HVISKE_TARGET_SR:-16000}
+      - HVISKE_DEFAULT_LANGUAGE=${HVISKE_DEFAULT_LANGUAGE:-da}
+      - HVISKE_MAX_NEW_TOKENS=${HVISKE_MAX_NEW_TOKENS:-256}
+      - HVISKE_NUM_BEAMS=${HVISKE_NUM_BEAMS:-1}
+      - HVISKE_LENGTH_PENALTY=${HVISKE_LENGTH_PENALTY:-1.0}
+      - HVISKE_PUNCTUATION=${HVISKE_PUNCTUATION:-true}
+      - HF_TOKEN=${HF_TOKEN:-}
+      #- HVISKE_MODEL_CACHE_DIR=/root/.cache/huggingface
+      #- HVISKE_HOST=${HVISKE_HOST:-0.0.0.0}
+      #- HVISKE_PORT=${HVISKE_PORT:-8000}
+      - HVISKE_LOG_LEVEL=${HVISKE_LOG_LEVEL:-info}
+    volumes:
+      - ./hf-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+#volumes:
+#  hf-cache:
