@@ -8,8 +8,10 @@ import soundfile as sf
 import librosa
 from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 from fastapi import FastAPI, File, Form, UploadFile, Query, Path, Request, Header
-from fastapi.responses import PlainTextResponse, StreamingResponse
-from fastapi.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.datastructures import Headers
+from starlette.types import Message
 from pydantic import BaseModel, Field
 
 # --- Configuration via environment variables ---
@@ -126,6 +128,16 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 app.add_middleware(APIKeyMiddleware)
 
 
+@app.middleware("http")
+async def add_timing_headers(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    elapsed = time.time() - start
+    response.headers["X-Processing-Time"] = f"{elapsed:.3f}s"
+    response.headers["X-Processing-Time-Ms"] = str(int(elapsed * 1000))
+    return response
+
+
 def load_model():
     global processor, model
     if processor is None or model is None:
@@ -228,17 +240,22 @@ def transcribe(
         "do_sample": False,
     }
 
-    with torch.no_grad():
-        outputs = model.generate(**inputs, **gen_kwargs)
+    try:
+        with torch.no_grad():
+            outputs = model.generate(**inputs, **gen_kwargs)
 
-    elapsed = time.time() - start_time
+        elapsed = time.time() - start_time
 
-    transcription = processor.decode(
-        outputs[0],
-        skip_special_tokens=True,
-        audio_chunk_index=audio_chunk_index,
-        language=language,
-    )
+        transcription = processor.decode(
+            outputs[0],
+            skip_special_tokens=True,
+            audio_chunk_index=audio_chunk_index,
+            language=language,
+        )
+    finally:
+        del inputs
+        del outputs
+        torch.cuda.empty_cache()
 
     return {
         "text": transcription,
