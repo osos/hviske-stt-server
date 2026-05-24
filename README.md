@@ -6,6 +6,10 @@ hviske-v5.3 is a 2B-parameter Conformer encoder-decoder ASR model fine-tuned on 
 
 [Model card](https://huggingface.co/syvai/hviske-v5.3) · [Hviske product page](https://syv.ai/produkter/hviske)
 
+## Hardware
+
+Tested on **NVIDIA DGX Spark (GB10 GPU)**. Any NVIDIA GPU with sufficient VRAM (~4 GB for bf16) will work.
+
 ## Quick start
 
 ```bash
