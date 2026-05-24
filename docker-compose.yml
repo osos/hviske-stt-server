@@ -20,6 +20,7 @@ services:
       #- HVISKE_HOST=${HVISKE_HOST:-0.0.0.0}
       #- HVISKE_PORT=${HVISKE_PORT:-8000}
       - HVISKE_LOG_LEVEL=${HVISKE_LOG_LEVEL:-info}
+      - HVISKE_API_KEY=${HVISKE_API_KEY:-}
     volumes:
       - ./hf-cache:/root/.cache/huggingface
     deploy:

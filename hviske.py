@@ -7,8 +7,9 @@ import numpy as np
 import soundfile as sf
 import librosa
 from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
-from fastapi import FastAPI, File, Form, UploadFile, Query, Path
+from fastapi import FastAPI, File, Form, UploadFile, Query, Path, Request, Header
 from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
 
 # --- Configuration via environment variables ---
@@ -25,6 +26,7 @@ PORT = int(os.getenv("HVISKE_PORT", "8000"))
 LOG_LEVEL = os.getenv("HVISKE_LOG_LEVEL", "info")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 MODEL_CACHE_DIR = os.getenv("HVISKE_MODEL_CACHE_DIR", "/root/.cache/huggingface")
+API_KEY = os.getenv("HVISKE_API_KEY", "")
 
 app = FastAPI(
     title="Hviske STT",
@@ -103,6 +105,25 @@ print(transcript.text)
 
 processor = None
 model = None
+
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if not API_KEY:
+            return await call_next(request)
+
+        auth = request.headers.get("Authorization", "")
+        if auth == f"Bearer {API_KEY}":
+            return await call_next(request)
+
+        return PlainTextResponse(
+            content=json.dumps({"error": "Invalid or missing API key."}),
+            status_code=401,
+            media_type="application/json",
+        )
+
+
+app.add_middleware(APIKeyMiddleware)
 
 
 def load_model():
