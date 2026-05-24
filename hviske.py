@@ -1,11 +1,16 @@
+import gc
 import io
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import time
-import torch
+from pathlib import Path as FilePath
+
 import numpy as np
 import soundfile as sf
-import librosa
+import torch
 from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 from fastapi import FastAPI, File, Form, UploadFile, Query, Path, Request, Header
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -29,6 +34,27 @@ LOG_LEVEL = os.getenv("HVISKE_LOG_LEVEL", "info")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 MODEL_CACHE_DIR = os.getenv("HVISKE_MODEL_CACHE_DIR", "/root/.cache/huggingface")
 API_KEY = os.getenv("HVISKE_API_KEY", "")
+CHUNK_SECONDS = int(os.getenv("HVISKE_CHUNK_SECONDS", "30"))
+CHUNK_OVERLAP_SECONDS = int(os.getenv("HVISKE_CHUNK_OVERLAP_SECONDS", "1"))
+
+
+def trim_malloc():
+    """Release memory back to the OS on Linux."""
+    if os.name == "posix":
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+
+def cleanup_gpu():
+    """Aggressive GPU memory cleanup."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
 
 app = FastAPI(
     title="Hviske STT",
@@ -163,55 +189,41 @@ async def startup_event():
     print("Warm-up complete. Server is ready.")
 
 
-def read_audio(audio_bytes: bytes):
-    import subprocess
-
-    buf = io.BytesIO(audio_bytes)
-    try:
-        audio, sr = sf.read(buf)
-        audio = np.asarray(audio, dtype=np.float32)
-        return audio, sr
-    except Exception:
-        pass
-
-    with tempfile.NamedTemporaryFile(suffix=".bin", delete=True) as tmp:
-        tmp.write(audio_bytes)
-        tmp.flush()
-        result = subprocess.run(
-            ["ffmpeg", "-i", tmp.name, "-f", "s16le", "-ac", "1", "-ar", str(TARGET_SR), "-"],
-            capture_output=True,
-        )
-        raw = result.stdout
-        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        sr = TARGET_SR
-
-    return audio, sr
+# --- Audio processing ---
 
 
-def transcribe(
-    audio_bytes: bytes,
-    language: str = DEFAULT_LANGUAGE,
-    prompt: str | None = None,
-    temperature: float = 0.0,
-):
-    import tempfile
+def convert_to_wav_16k_mono(input_path: str) -> str:
+    """Convert any audio format to 16kHz mono WAV on disk."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
 
-    load_model()
+    subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-y",
+            "-i", input_path,
+            "-ac", "1",
+            "-ar", str(TARGET_SR),
+            "-f", "wav",
+            tmp.name,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
 
-    audio, sr = read_audio(audio_bytes)
+    return tmp.name
+
+
+def transcribe_chunk(audio: np.ndarray, language: str, prompt: str | None = None) -> str:
+    """Transcribe a single audio chunk through the model."""
+    global model, processor
 
     if audio.ndim > 1:
         audio = np.mean(audio, axis=1)
 
-    if sr != TARGET_SR:
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SR)
-        sr = TARGET_SR
-
-    duration = len(audio) / sr
-
     inputs = processor(
         audio=audio,
-        sampling_rate=sr,
+        sampling_rate=TARGET_SR,
         return_tensors="pt",
         language=language,
         punctuation=PUNCTUATION,
@@ -231,8 +243,6 @@ def transcribe(
                 device=model.device,
             )
 
-    start_time = time.time()
-
     gen_kwargs = {
         "max_new_tokens": MAX_NEW_TOKENS,
         "num_beams": NUM_BEAMS,
@@ -241,28 +251,126 @@ def transcribe(
     }
 
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model.generate(**inputs, **gen_kwargs)
 
-        elapsed = time.time() - start_time
+        # Move to CPU before decode so GPU memory is freed sooner
+        output_ids = outputs[0].detach().cpu()
 
-        transcription = processor.decode(
-            outputs[0],
+        text = processor.decode(
+            output_ids,
             skip_special_tokens=True,
             audio_chunk_index=audio_chunk_index,
             language=language,
         )
-    finally:
-        del inputs
-        del outputs
-        torch.cuda.empty_cache()
 
-    return {
-        "text": transcription,
-        "language": language,
-        "duration": round(duration, 2),
-        "processing_time": round(elapsed, 2),
-    }
+        return text.strip()
+
+    finally:
+        del inputs, outputs, output_ids
+        cleanup_gpu()
+
+
+def dedup_overlap(previous_tail: str, current_text: str) -> str:
+    """Remove overlapping words at the start of current_text that match previous_tail.
+
+    Compares words from the end of previous_tail against the start of current_text
+    and strips duplicates. Case-insensitive, punctuation-tolerant.
+    """
+    import re
+
+    if not previous_tail or not current_text:
+        return current_text
+
+    def tokenize(text: str) -> list[str]:
+        return re.findall(r"\S+", text.lower())
+
+    prev_words = tokenize(previous_tail)
+    curr_words = tokenize(current_text)
+
+    # Check up to the last 80 words of previous chunk
+    max_check = min(len(prev_words), 80)
+    prev_tail_words = prev_words[-max_check:] if max_check else []
+
+    if not prev_tail_words or not curr_words:
+        return current_text
+
+    # Find how many words at the start of current match the tail of previous
+    skip = 0
+    for i, tail_word in enumerate(prev_tail_words):
+        if i < len(curr_words) and curr_words[i] == tail_word:
+            skip = i + 1
+        else:
+            break
+
+    # Need at least 3 matching words to consider it an overlap (avoids false positives)
+    if skip >= 3:
+        # Reconstruct text skipping the duplicated words
+        curr_tokens = list(re.finditer(r"\S+", current_text))
+        if skip < len(curr_tokens):
+            start_pos = curr_tokens[skip].start()
+            return current_text[start_pos:]
+
+    return current_text
+
+
+def transcribe_file(
+    input_path: str,
+    language: str = DEFAULT_LANGUAGE,
+    prompt: str | None = None,
+    temperature: float = 0.0,
+):
+    """Transcribe audio file in chunks for constant memory usage."""
+    load_model()
+
+    wav_path = convert_to_wav_16k_mono(input_path)
+    start_time = time.time()
+
+    texts: list[str] = []
+    total_frames = 0
+
+    blocksize = CHUNK_SECONDS * TARGET_SR
+    overlap = CHUNK_OVERLAP_SECONDS * TARGET_SR
+
+    try:
+        with sf.SoundFile(wav_path) as f:
+            for block in f.blocks(blocksize=blocksize, overlap=overlap, dtype="float32", always_2d=False):
+                if len(block) == 0:
+                    continue
+
+                total_frames += len(block)
+
+                text = transcribe_chunk(np.asarray(block, dtype=np.float32), language, prompt)
+
+                if text:
+                    if texts:
+                        prev_text = texts[-1]
+                        text = dedup_overlap(prev_text, text)
+
+                    if text:
+                        texts.append(text)
+
+                del block
+                cleanup_gpu()
+
+        elapsed = time.time() - start_time
+        duration = total_frames / TARGET_SR
+
+        return {
+            "text": " ".join(texts).strip(),
+            "language": language,
+            "duration": round(duration, 2),
+            "processing_time": round(elapsed, 2),
+        }
+
+    finally:
+        try:
+            os.unlink(wav_path)
+        except FileNotFoundError:
+            pass
+
+        cleanup_gpu()
+        trim_malloc()
 
 
 # --- Response models matching OpenAI spec ---
@@ -485,10 +593,15 @@ async def create_transcription(
         description="Audio samples for known speaker references. Not supported by Hviske.",
     ),
 ):
-    audio_bytes = await file.read()
-
     lang = language or DEFAULT_LANGUAGE
-    result = transcribe(audio_bytes, language=lang, prompt=prompt, temperature=temperature)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=FilePath(file.filename or "audio").suffix, delete=False)
+    try:
+        shutil.copyfileobj(file.file, tmp)
+        tmp.close()
+        result = transcribe_file(tmp.name, language=lang, prompt=prompt, temperature=temperature)
+    finally:
+        os.unlink(tmp.name)
 
     granularities = []
     if timestamp_granularities:
